@@ -19,6 +19,7 @@
 #define DEFAULT_PORT 80
 #define BUFFERSIZE 4096
 #define THREAD_POOL_SIZE 20
+#define FILEDIR "serve"
 
 struct sized_str {
     char *ptr;
@@ -72,7 +73,12 @@ int is_same_string(struct sized_str str, const char *restrict str2) {
 }
 
 struct sized_str read_file(const char *restrict filepath, struct arena *arena) {
-    FILE *f = fopen(filepath, "r");
+    char complete_filepath[strlen(FILEDIR)+strlen(filepath)+1];
+    memcpy(complete_filepath, FILEDIR, strlen(FILEDIR));
+    memcpy(complete_filepath+strlen(FILEDIR), filepath, strlen(filepath));
+    complete_filepath[strlen(FILEDIR)+strlen(filepath)] = '\0';
+
+    FILE *f = fopen(complete_filepath, "r");
 
     if (!f) {
         error_exit("fopen()");
@@ -102,7 +108,7 @@ int gzip_compress(char *restrict out_buf, struct sized_str str) {
 		.avail_out = BUFFERSIZE, .next_out = (Bytef *) out_buf
 	};
 
-	// error checking???
+	// TODO: error checking???
 	deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 | 16, 8, Z_DEFAULT_STRATEGY);
 	deflate(&zs, Z_FINISH);
 	deflateEnd(&zs);
@@ -289,13 +295,6 @@ struct http_req *http_parse_req_headers(const char *raw_req, const size_t raw_re
 
     req->headers_length = offset + 2;
 
-    // if (req->headers_length != raw_req_len) {
-    //     req->body = (struct sized_str) { .ptr = req->raw_req.ptr + req->headers_length, .len = req->raw_req.len - req->headers_length };
-
-    //     if (req->body.len != req->content_length || req->headers_length + req->body.len != raw_req_len)
-    //         ; // TODO: error ? What about multiple http requests on the socket?
-    // }
-
     return req;
 }
 
@@ -372,7 +371,7 @@ struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
         if (req->method != GET && req->method != HEAD)
             goto method_not_allowed;
 
-        struct sized_str file_content = read_file("serve/index.html", arena);
+        struct sized_str file_content = read_file("/index.html", arena);
         if (!file_content.len)
             goto not_found;
 
@@ -382,19 +381,16 @@ struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
             .content_type = http_content_type_text_html
         };
     } else if ((index = post_prefix_index(req->url_path, "/user-agent")) != -1) {
+        if (req->method != GET && req->method != HEAD)
+            goto method_not_allowed;
+
         if (req->url_path.len != index) {
             if (req->url_path.ptr[index] != '/' || req->url_path.len != index+1)
                 goto not_found;
 
-            if (req->method == GET || req->method == HEAD) {
-                *reply = (struct http_reply) { .status = 301, .location = (struct sized_str) { .ptr = "/user-agent", .len = 11 } };
-                return reply;
-            } else
-                goto method_not_allowed;
+            *reply = (struct http_reply) { .status = 301, .location = (struct sized_str) { .ptr = "/user-agent", .len = 11 } };
+            return reply;
         }
-
-        if (req->method != GET && req->method != HEAD)
-            goto method_not_allowed;
 
         *reply = (struct http_reply) {
             .status = 200,
@@ -402,19 +398,14 @@ struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
             .content_type = http_content_type_text_plain
         };
     } else if ((index = post_prefix_index(req->url_path, "/echo")) != -1) {
-        if (req->url_path.len == 5) {
-            if (req->method == GET || req->method == HEAD) {
-                *reply = (struct http_reply) { .status = 301, .location = (struct sized_str) { .ptr = "/echo/", .len = 6 } };
-                return reply;
-            } else
-                goto method_not_allowed;
-        }
-
-        if (req->url_path.ptr[5] != '/')
-            goto not_found;
-
         if (req->method != GET && req->method != HEAD)
             goto method_not_allowed;
+
+        if (req->url_path.len == 5) {
+            *reply = (struct http_reply) { .status = 301, .location = (struct sized_str) { .ptr = "/echo/", .len = 6 } };
+            return reply;
+        } else if (req->url_path.ptr[5] != '/')
+            goto not_found;
 
         *reply = (struct http_reply) {
             .status = 200,
@@ -422,8 +413,15 @@ struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
             .content_type = http_content_type_text_plain
         };
     } else {
-    not_found:
+    not_found:;
         *reply = (struct http_reply) { .status = 404 };
+
+        struct sized_str file_content = read_file("/404.html", arena);
+        if (file_content.len) {
+            reply->body = file_content;
+            reply->content_type = http_content_type_text_html;
+        }
+
         return reply;
     }
 
@@ -546,8 +544,14 @@ void *handle_client(void *args) {
 
             const struct sized_str res = http_prepare_res(reply, req, arena);
 
-            if (send(client_fd, res.ptr, res.len, 0) < 0)
-                error_exit("send()");
+            int total_bytes_sent = 0;
+
+            while (total_bytes_sent < res.len) {
+                const int bytes_sent = send(client_fd, res.ptr+total_bytes_sent, res.len-total_bytes_sent, 0);
+                if (bytes_sent < 0)
+                    error_exit("send()");
+                total_bytes_sent += bytes_sent;
+            }
 
             arena_clear(arena);
         }
