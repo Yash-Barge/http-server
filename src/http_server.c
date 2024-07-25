@@ -104,7 +104,7 @@ struct sized_str read_file(const char *restrict filepath, struct arena *arena) {
     memcpy(complete_filepath+strlen(FILEDIR), filepath, strlen(filepath));
     complete_filepath[strlen(FILEDIR)+strlen(filepath)] = '\0';
 
-    FILE *f = fopen(complete_filepath, "r");
+    FILE *f = fopen(complete_filepath, "rb");
 
     if (!f) {
         error_exit("fopen()");
@@ -137,7 +137,7 @@ enum http_content_type get_file_type(const struct sized_str path) {
         if (path.ptr[i] == '.')
             break;
     
-    if (i == -1) // no file extension, just octet stream
+    if (i == -1) // no file extension, fallback to octet stream
         return http_content_type_application_octet_stream;
     
     const struct sized_str file_extension = { .ptr = path.ptr + i + 1, .len = path.len - i - 1 };
@@ -155,6 +155,7 @@ enum http_content_type get_file_type(const struct sized_str path) {
     RET_IF("css", http_content_type_text_css);
     RET_IF("html", http_content_type_text_html);
     RET_IF("js", http_content_type_text_javascript);
+    RET_IF("txt", http_content_type_text_plain);
 
     // unknown file extension
     return http_content_type_application_octet_stream;
@@ -165,7 +166,7 @@ enum http_content_type get_file_type(const struct sized_str path) {
 int gzip_compress(char *restrict out_buf, struct sized_str str) {
 	z_stream zs = { .zalloc = Z_NULL, .zfree = Z_NULL, .opaque = Z_NULL,
 		.avail_in = str.len, .next_in = (Bytef *) str.ptr,
-		.avail_out = BUFFERSIZE, .next_out = (Bytef *) out_buf
+		.avail_out = str.len, .next_out = (Bytef *) out_buf
 	};
 
 	// TODO: error checking???
@@ -539,10 +540,15 @@ struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
     if (req->accept_compression && reply->body.len) { // TODO: add br compression? (no deflate)
         reply->content_encoding = 1;
 
-        char temp_buf[BUFFERSIZE] = { 0 }; // TODO: scratch arena?
+        char *temp_buf = arena_alloc(arena, reply->body.len); // TODO: scratch arena?
         const int body_len = gzip_compress(temp_buf, reply->body);
-        reply->body = (struct sized_str) { .ptr = arena_alloc(arena, body_len), .len = body_len };
-        memcpy(reply->body.ptr, temp_buf, body_len);
+
+        // if larger when compressed, send uncompressed
+        // (when size is equal, most likely compression did not finish)
+        if (body_len < reply->body.len)
+            reply->body = (struct sized_str) { .ptr = temp_buf, .len = body_len };
+        else
+            reply->content_encoding = 0;
     }
 
     return reply;

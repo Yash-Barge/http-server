@@ -82,10 +82,10 @@ extern const char *http_headers_str[];
 	macro(image, x, icon) \
 	macro(image, webp) \
 	\
-	macro(text, plain) \
 	macro(text, css) \
 	macro(text, html) \
-	macro(text, javascript)
+	macro(text, javascript) \
+	macro(text, plain)
 
 enum http_content_type { FOREACH_HTTP_CONTENT_TYPE(HTTP_CONTENT_TYPE_ENUMIFY) };
 extern const char *http_content_type_str[];
