@@ -9,6 +9,7 @@
 #include <time.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <sys/stat.h>
 
 #include <zlib.h>
 
@@ -72,6 +73,31 @@ int is_same_string(struct sized_str str, const char *restrict str2) {
 	return (str.len == strlen(str2)) && !memcmp(str.ptr, str2, str.len);
 }
 
+char dir_or_file(const struct sized_str path) {
+    char c_path[strlen(FILEDIR)+path.len+1];
+    memcpy(c_path, FILEDIR, strlen(FILEDIR));
+    memcpy(c_path+strlen(FILEDIR), path.ptr, path.len);
+    c_path[strlen(FILEDIR)+path.len] = '\0';
+
+    struct stat st_buf;
+    const int stat_retval = stat(c_path, &st_buf);
+
+    if (stat_retval == -1) {
+        if (errno == ENOENT || errno == ENOTDIR)
+            return '\0';
+        error_exit("stat()");
+    }
+
+    if (S_ISDIR(st_buf.st_mode))
+        return 'd';
+    
+    if (S_ISREG(st_buf.st_mode))
+        return 'f';
+
+    fprintf(stderr, "%s exists, but is neither file nor directory!\n", c_path);
+    return 'e'; // treat as 500
+}
+
 struct sized_str read_file(const char *restrict filepath, struct arena *arena) {
     char complete_filepath[strlen(FILEDIR)+strlen(filepath)+1];
     memcpy(complete_filepath, FILEDIR, strlen(FILEDIR));
@@ -101,6 +127,40 @@ struct sized_str read_file(const char *restrict filepath, struct arena *arena) {
 
     return retval;
 }
+
+#define RET_IF(str, retval) do { if (is_same_string(file_extension, str)) return retval; } while (0)
+
+// TODO: image/svg+xml not supported (only svg MIME type)
+enum http_content_type get_file_type(const struct sized_str path) {
+    int i;
+    for (i = path.len-1; i >= 0; i--)
+        if (path.ptr[i] == '.')
+            break;
+    
+    if (i == -1) // no file extension, just octet stream
+        return http_content_type_application_octet_stream;
+    
+    const struct sized_str file_extension = { .ptr = path.ptr + i + 1, .len = path.len - i - 1 };
+
+    RET_IF("avif", http_content_type_image_avif);
+    RET_IF("avifs", http_content_type_image_avif);
+    RET_IF("bmp", http_content_type_image_bmp);
+    RET_IF("gif", http_content_type_image_gif);
+    RET_IF("jpg", http_content_type_image_jpeg);
+    RET_IF("jpeg", http_content_type_image_jpeg);
+    RET_IF("png", http_content_type_image_png);
+    RET_IF("ico", http_content_type_image_x_icon);
+    RET_IF("webp", http_content_type_image_webp);
+
+    RET_IF("css", http_content_type_text_css);
+    RET_IF("html", http_content_type_text_html);
+    RET_IF("js", http_content_type_text_javascript);
+
+    // unknown file extension
+    return http_content_type_application_octet_stream;
+}
+
+#undef RET_IF
 
 int gzip_compress(char *restrict out_buf, struct sized_str str) {
 	z_stream zs = { .zalloc = Z_NULL, .zfree = Z_NULL, .opaque = Z_NULL,
@@ -367,20 +427,7 @@ struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
 
     req->url_path = sanitized_url_path;
 
-    if (is_same_string(req->url_path, "/")) {
-        if (req->method != GET && req->method != HEAD)
-            goto method_not_allowed;
-
-        struct sized_str file_content = read_file("/index.html", arena);
-        if (!file_content.len)
-            goto not_found;
-
-        *reply = (struct http_reply) {
-            .status = 200,
-            .body = file_content,
-            .content_type = http_content_type_text_html
-        };
-    } else if ((index = post_prefix_index(req->url_path, "/user-agent")) != -1) {
+    if ((index = post_prefix_index(req->url_path, "/user-agent")) != -1) {
         if (req->method != GET && req->method != HEAD)
             goto method_not_allowed;
 
@@ -413,19 +460,83 @@ struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
             .content_type = http_content_type_text_plain
         };
     } else {
-    not_found:;
-        *reply = (struct http_reply) { .status = 404 };
+        // TODO: how to refactor this to be on a per route basis?
+        if (req->method != GET && req->method != HEAD)
+            goto method_not_allowed;
 
-        struct sized_str file_content = read_file("/404.html", arena);
-        if (file_content.len) {
-            reply->body = file_content;
-            reply->content_type = http_content_type_text_html;
+        const char d_or_f = dir_or_file(req->url_path);
+        switch (d_or_f) {
+            char *temp_buf;
+            struct sized_str file_content;
+
+            case '\0':
+                goto not_found;
+            case 'e':
+                // TODO: 500
+                break;
+            case 'd':
+                if (req->url_path.ptr[req->url_path.len-1] != '/') { // enforce directory semantics
+                    *reply = (struct http_reply) {
+                        .status = 301,
+                        .location = (struct sized_str) { .ptr = arena_alloc(arena, req->url_path.len+1), .len = req->url_path.len+1 }
+                    };
+                    memcpy(reply->location.ptr, req->url_path.ptr, req->url_path.len);
+                    reply->location.ptr[req->url_path.len] = '/';
+
+                    return reply;
+                }
+
+                temp_buf = arena_alloc(arena, req->url_path.len+11); // TODO: scratch?
+                memcpy(temp_buf, req->url_path.ptr, req->url_path.len);
+                temp_buf[req->url_path.len] = '\0';
+                strcat(temp_buf, "index.html");
+
+                file_content = read_file(temp_buf, arena);
+                if (!file_content.len)
+                    goto not_found;
+
+                *reply = (struct http_reply) {
+                    .status = 200,
+                    .body = file_content,
+                    .content_type = http_content_type_text_html
+                };
+
+                break;
+            case 'f':
+                if (req->url_path.len > 10 && !strncmp(req->url_path.ptr + req->url_path.len - 10, "index.html", 10)) {
+                    *reply = (struct http_reply) {
+                        .status = 301,
+                        .location = (struct sized_str) { .ptr = arena_alloc(arena, req->url_path.len-10), .len = req->url_path.len-10 }
+                    };
+                    memcpy(reply->location.ptr, req->url_path.ptr, req->url_path.len-10);
+
+                    return reply;
+                }
+
+                temp_buf = arena_alloc(arena, req->url_path.len+1);
+                memcpy(temp_buf, req->url_path.ptr, req->url_path.len);
+                temp_buf[req->url_path.len] = '\0';
+
+                file_content = read_file(temp_buf, arena);
+                if (!file_content.len) { // file SHOULD exist, verified through dir_or_file
+                    // TODO: 500
+                }
+
+                *reply = (struct http_reply) {
+                    .status = 200,
+                    .body = file_content,
+                    .content_type = get_file_type(req->url_path)
+                };
+
+                break;
+            default:
+                fprintf(stderr, "Unchecked return type %c from dir_or_file()\n", d_or_f);
+                // TODO: 500
+                break;
         }
-
-        return reply;
     }
 
-    if (req->accept_compression && reply->body.len) { // TODO: more types of compression
+    if (req->accept_compression && reply->body.len) { // TODO: add br compression? (no deflate)
         reply->content_encoding = 1;
 
         char temp_buf[BUFFERSIZE] = { 0 }; // TODO: scratch arena?
@@ -436,12 +547,23 @@ struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
 
     return reply;
 
-method_not_allowed:
-    *reply = (struct http_reply) { .status = 405 };
-    return reply;
-
 bad_request:
     *reply = (struct http_reply) { .status = 400 };
+    return reply;
+
+not_found:
+    *reply = (struct http_reply) { .status = 404 };
+
+    struct sized_str file_content = read_file("/404.html", arena);
+    if (file_content.len) {
+        reply->body = file_content;
+        reply->content_type = http_content_type_text_html;
+    }
+
+    return reply;
+
+method_not_allowed:
+    *reply = (struct http_reply) { .status = 405 };
     return reply;
 }
 

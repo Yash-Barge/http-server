@@ -70,10 +70,22 @@ extern const char *http_headers_str[];
 #define HTTP_CONTENT_TYPE_ENUMIFY(...) APPLY(DISPATCH, COUNT(__VA_ARGS__))(http_content_type_, __VA_ARGS__),
 #define HTTP_CONTENT_TYPE_STRINGIFY(...) APPLY(DISPATCH_STR, COUNT(__VA_ARGS__))(/, -, __VA_ARGS__),
 
+// ! application/octet-stream should remain first, so if content_type is omitted, defaults to this
 #define FOREACH_HTTP_CONTENT_TYPE(macro) \
-	macro(text, html) \
+	macro(application, octet, stream) \
+	\
+	macro(image, avif) \
+	macro(image, bmp) \
+	macro(image, gif) \
+	macro(image, jpeg) \
+	macro(image, png) \
+	macro(image, x, icon) \
+	macro(image, webp) \
+	\
 	macro(text, plain) \
-	macro(application, octet, stream)
+	macro(text, css) \
+	macro(text, html) \
+	macro(text, javascript)
 
 enum http_content_type { FOREACH_HTTP_CONTENT_TYPE(HTTP_CONTENT_TYPE_ENUMIFY) };
 extern const char *http_content_type_str[];

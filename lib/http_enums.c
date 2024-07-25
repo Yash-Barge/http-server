@@ -9,7 +9,8 @@ const char *http_status_codes_str[] = {
     [308] = "Permanent Redirect",
     [400] = "Bad Request",
     [404] = "Not Found",
-    [405] = "Method Not Allowed"
+    [405] = "Method Not Allowed",
+    [500] = "Internal Server Error"
 };
 
 const char *http_methods_str[] = { FOREACH_HTTP_METHOD(GENERATE_STRING) };
