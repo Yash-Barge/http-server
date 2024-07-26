@@ -1,3 +1,4 @@
+#include <string.h>
 #include <strings.h>
 
 #include "sized_str.h"
