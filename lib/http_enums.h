@@ -5,6 +5,8 @@
 #ifndef H_INTERNAL_HTTP_ENUMS
 #define H_INTERNAL_HTTP_ENUMS
 
+#include "sized_str.h"
+
 
 
 extern const char *http_status_codes_str[];
@@ -27,6 +29,7 @@ extern const char *http_status_codes_str[];
 
 enum http_methods { FOREACH_HTTP_METHOD(GENERATE_ENUM) };
 extern const char *http_methods_str[];
+enum http_methods method_enumify(const struct sized_str str);
 
 
 
@@ -89,6 +92,7 @@ extern const char *http_headers_str[];
 
 enum http_content_type { FOREACH_HTTP_CONTENT_TYPE(HTTP_CONTENT_TYPE_ENUMIFY) };
 extern const char *http_content_type_str[];
+enum http_content_type get_file_type(const struct sized_str path);
 
 
 

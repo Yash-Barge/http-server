@@ -1,31 +1,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <pthread.h>
-#include <time.h>
-#include <stdarg.h>
 #include <errno.h>
-#include <sys/stat.h>
-
-#include <zlib.h>
 
 #include "arena.h"
 #include "http_enums.h"
+#include "lib.h"
+#include "sized_str.h"
 #include "socket_queue.h"
 
 #define DEFAULT_PORT 80
 #define BUFFERSIZE 4096
 #define THREAD_POOL_SIZE 20
-#define FILEDIR "serve"
 
-struct sized_str {
-    char *ptr;
-    size_t len;
-};
+// NOTE: serve directory defined in lib.c
+
+__thread char *g_err_500_msg;
 
 struct http_req {
     struct sized_str raw_req;
@@ -44,161 +38,7 @@ struct http_reply {
     int content_encoding;
     struct sized_str location;
     struct sized_str body;
-    struct http_req *req;
 };
-
-void error_exit(const char *err_msg) {
-    perror(err_msg);
-    exit(EXIT_FAILURE);
-}
-
-int is_whitespace(char c) {
-	return (c == 0x09 || c == 0x0A || c == 0x0C || c == 0x0D || c == 0x20);
-}
-
-int post_prefix_index(const struct sized_str str, const char *restrict prefix) {
-    unsigned int offset = 0;
-    const size_t str_len = strlen(prefix);
-
-    while (is_whitespace(str.ptr[offset]))
-        offset++;
-
-	if ((str.len-offset) >= str_len && !strncasecmp(str.ptr+offset, prefix, str_len))
-        return offset+str_len;
-
-    return -1;
-}
-
-int is_same_string(struct sized_str str, const char *restrict str2) {
-	return (str.len == strlen(str2)) && !memcmp(str.ptr, str2, str.len);
-}
-
-char dir_or_file(const struct sized_str path) {
-    char c_path[strlen(FILEDIR)+path.len+1];
-    memcpy(c_path, FILEDIR, strlen(FILEDIR));
-    memcpy(c_path+strlen(FILEDIR), path.ptr, path.len);
-    c_path[strlen(FILEDIR)+path.len] = '\0';
-
-    struct stat st_buf;
-    const int stat_retval = stat(c_path, &st_buf);
-
-    if (stat_retval == -1) {
-        if (errno == ENOENT || errno == ENOTDIR)
-            return '\0';
-        error_exit("stat()");
-    }
-
-    if (S_ISDIR(st_buf.st_mode))
-        return 'd';
-    
-    if (S_ISREG(st_buf.st_mode))
-        return 'f';
-
-    fprintf(stderr, "%s exists, but is neither file nor directory!\n", c_path);
-    return 'e'; // treat as 500
-}
-
-struct sized_str read_file(const char *restrict filepath, struct arena *arena) {
-    char complete_filepath[strlen(FILEDIR)+strlen(filepath)+1];
-    memcpy(complete_filepath, FILEDIR, strlen(FILEDIR));
-    memcpy(complete_filepath+strlen(FILEDIR), filepath, strlen(filepath));
-    complete_filepath[strlen(FILEDIR)+strlen(filepath)] = '\0';
-
-    FILE *f = fopen(complete_filepath, "rb");
-
-    if (!f) {
-        error_exit("fopen()");
-        return (struct sized_str) { 0 };
-    }
-
-    fseek(f, 0, SEEK_END);
-    const int file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-
-    struct sized_str retval = { .ptr = arena_alloc(arena, file_size), .len = file_size };
-
-    const int bytes_read = fread(retval.ptr, 1, file_size, f);
-
-    if (bytes_read != file_size) {
-        error_exit("fread()");
-        return (struct sized_str) { 0 };
-    }
-
-    return retval;
-}
-
-#define RET_IF(str, retval) do { if (is_same_string(file_extension, str)) return retval; } while (0)
-
-// TODO: image/svg+xml not supported (only svg MIME type)
-enum http_content_type get_file_type(const struct sized_str path) {
-    int i;
-    for (i = path.len-1; i >= 0; i--)
-        if (path.ptr[i] == '.')
-            break;
-    
-    if (i == -1) // no file extension, fallback to octet stream
-        return http_content_type_application_octet_stream;
-    
-    const struct sized_str file_extension = { .ptr = path.ptr + i + 1, .len = path.len - i - 1 };
-
-    RET_IF("avif", http_content_type_image_avif);
-    RET_IF("avifs", http_content_type_image_avif);
-    RET_IF("bmp", http_content_type_image_bmp);
-    RET_IF("gif", http_content_type_image_gif);
-    RET_IF("jpg", http_content_type_image_jpeg);
-    RET_IF("jpeg", http_content_type_image_jpeg);
-    RET_IF("png", http_content_type_image_png);
-    RET_IF("ico", http_content_type_image_x_icon);
-    RET_IF("webp", http_content_type_image_webp);
-
-    RET_IF("css", http_content_type_text_css);
-    RET_IF("html", http_content_type_text_html);
-    RET_IF("js", http_content_type_text_javascript);
-    RET_IF("txt", http_content_type_text_plain);
-
-    // unknown file extension
-    return http_content_type_application_octet_stream;
-}
-
-#undef RET_IF
-
-int gzip_compress(char *restrict out_buf, struct sized_str str) {
-	z_stream zs = { .zalloc = Z_NULL, .zfree = Z_NULL, .opaque = Z_NULL,
-		.avail_in = str.len, .next_in = (Bytef *) str.ptr,
-		.avail_out = str.len, .next_out = (Bytef *) out_buf
-	};
-
-	// TODO: error checking???
-	deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 | 16, 8, Z_DEFAULT_STRATEGY);
-	deflate(&zs, Z_FINISH);
-	deflateEnd(&zs);
-
-	return zs.total_out; // success
-}
-
-void print_to_log(const char *restrict fmt, ...) {
-    const time_t rawtime = time(NULL);
-    const struct tm *timeinfo = localtime(&rawtime);
-
-    flockfile(stdout);
-
-    fprintf(stdout, "[\033[2m%02d/%02d/%02d %02d:%02d:%02d\033[0m] ",
-        timeinfo->tm_mday, timeinfo->tm_mon + 1, timeinfo->tm_year - 100,
-        timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec
-    );
-
-    va_list arg;
-    va_start(arg, fmt);
-    vfprintf(stdout, fmt, arg);
-    va_end(arg);
-
-    fprintf(stdout, "\n");
-
-    funlockfile(stdout);
-
-    return;
-}
 
 void log_req(const struct http_req *restrict req, const struct http_reply *restrict reply) {
     char *color;
@@ -217,18 +57,27 @@ void log_req(const struct http_req *restrict req, const struct http_reply *restr
             color = "\033[1;35m"; // magenta
             break;
         case 5:
-            color = "\033[1;33m"; // yellow
-            break;
-        default: // error
             color = "\033[1;31m"; // red
             break;
+        default: // error
+            color = "\033[1;33m"; // yellow
+            break;
     }
+
+    flockfile(stdout);
+    flockfile(stderr);
 
     print_to_log("%s %.*s %s%d\033[0m",
         http_methods_str[req->method],
         (int) req->url_path.len, req->url_path.ptr,
         color, reply->status
     );
+
+    if (reply->status / 100 == 5)
+        fprintf(stderr, "\033[1;31merror:\033[0m %.*s\n", (int) reply->body.len, reply->body.ptr);
+
+    funlockfile(stdout);
+    funlockfile(stderr);
 
     return;
 }
@@ -249,14 +98,6 @@ struct sized_str http_get_next_header(const struct sized_str *restrict req, cons
     return retval;
 }
 
-enum http_methods method_enumify(const struct sized_str str) {
-	for (int i = 0; i < METHOD_COUNT; i++)
-		if (!strncmp(str.ptr, http_methods_str[i], str.len))
-			return i;
-
-	return -1;
-}
-
 void http_parse_header(const struct sized_str *restrict header_field, struct http_req *req) {
     int index = -1;
     int header_type;
@@ -268,7 +109,7 @@ void http_parse_header(const struct sized_str *restrict header_field, struct htt
     if (index == -1) // TODO: error condition ?
         return;
     
-    while (header_field->ptr[index] == ':' || is_whitespace(header_field->ptr[index]))
+    while (header_field->ptr[index] == ':' || IS_WHITESPACE(header_field->ptr[index]))
         index++;
 
     switch (header_type) {
@@ -276,7 +117,7 @@ void http_parse_header(const struct sized_str *restrict header_field, struct htt
 
         case http_header_accept_encoding:
             while (index < header_field->len) {
-				if (is_whitespace(header_field->ptr[index]))
+				if (IS_WHITESPACE(header_field->ptr[index]))
 					index++;
 				else if (strncmp(header_field->ptr + index, "gzip", 4)) {
 					while (index < header_field->len && header_field->ptr[index] != ',')
@@ -359,69 +200,11 @@ struct http_req *http_parse_req_headers(const char *raw_req, const size_t raw_re
     return req;
 }
 
-struct sized_str validate_url_path(struct sized_str url_path, struct arena *arena) {
-    if (!url_path.len)
-        return (struct sized_str) { 0 };
-
-    char *temp_buf = arena_alloc(arena, url_path.len+1); // TODO: scratch?
-    memcpy(temp_buf, url_path.ptr, url_path.len);
-    temp_buf[url_path.len] = '\0';
-
-    char **tok_stack = arena_alloc(arena, sizeof(*tok_stack) * url_path.len);
-    memset(tok_stack, 0, sizeof(*tok_stack) * url_path.len);
-    int valid_tok_count = 0;
-
-    char *saveptr;
-
-    int total_tok_count;
-    for (total_tok_count = 0; ; temp_buf = NULL, total_tok_count++) {
-        char *tok = strtok_r(temp_buf, "/", &saveptr);
-
-        if (!tok)
-            break;
-
-        int is_dir_up = !strcmp(tok, "..");
-
-        if (!strcmp(tok, "."))
-            continue;
-
-        if (is_dir_up) {
-            if (!valid_tok_count)
-                return (struct sized_str) { 0 };
-
-            tok_stack[--valid_tok_count] = NULL;
-        } else
-            tok_stack[valid_tok_count++] = tok;
-    }
-    // validated
-
-    if (total_tok_count == valid_tok_count) // no `..` present in url
-        return url_path;
-
-    if (!valid_tok_count)
-        return (struct sized_str) { .ptr = "/", .len = 1 };
-
-    // rebuild
-    const int new_length = url_path.len - 3*(total_tok_count - valid_tok_count);
-    char *new_url = arena_alloc(arena, new_length);
-
-    int offset = 0;
-    for (int index = 0; offset < new_length && index < valid_tok_count; offset += strlen(tok_stack[index++])) {
-        new_url[offset++] = '/';
-        memcpy(new_url+offset, tok_stack[index], strlen(tok_stack[index]));
-    }
-
-    if (url_path.ptr[url_path.len-1] == '/') // preserve trailing slash
-        new_url[offset++] = '/';
-
-    return (struct sized_str) { .ptr = new_url, .len = offset };
-}
-
 struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
     struct http_reply *reply = arena_alloc(arena, sizeof *reply);
     int index;
 
-    struct sized_str sanitized_url_path = validate_url_path(req->url_path, arena);
+    struct sized_str sanitized_url_path = validate_path(req->url_path, arena);
 
     if (!sanitized_url_path.len) // log_req has actual url_path
         goto bad_request;
@@ -465,16 +248,15 @@ struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
         if (req->method != GET && req->method != HEAD)
             goto method_not_allowed;
 
-        const char d_or_f = dir_or_file(req->url_path);
+        const char d_or_f = dir_or_file(req->url_path, arena);
         switch (d_or_f) {
             char *temp_buf;
             struct sized_str file_content;
 
             case '\0':
                 goto not_found;
-            case 'e':
-                // TODO: 500
-                break;
+            case 'e': // err_500 already set
+                goto server_error;
             case 'd':
                 if (req->url_path.ptr[req->url_path.len-1] != '/') { // enforce directory semantics
                     *reply = (struct http_reply) {
@@ -487,13 +269,14 @@ struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
                     return reply;
                 }
 
-                temp_buf = arena_alloc(arena, req->url_path.len+11); // TODO: scratch?
+                temp_buf = arena_alloc(arena, req->url_path.len+10); // TODO: scratch?
                 memcpy(temp_buf, req->url_path.ptr, req->url_path.len);
-                temp_buf[req->url_path.len] = '\0';
-                strcat(temp_buf, "index.html");
+                memcpy(temp_buf+req->url_path.len, "index.html", 10);
 
-                file_content = read_file(temp_buf, arena);
-                if (!file_content.len)
+                file_content = read_file((struct sized_str) { .ptr = temp_buf, .len = req->url_path.len+10 } , arena);
+                if (g_err_500_msg)
+                    goto server_error;
+                else if (!file_content.len)
                     goto not_found;
 
                 *reply = (struct http_reply) {
@@ -514,14 +297,9 @@ struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
                     return reply;
                 }
 
-                temp_buf = arena_alloc(arena, req->url_path.len+1);
-                memcpy(temp_buf, req->url_path.ptr, req->url_path.len);
-                temp_buf[req->url_path.len] = '\0';
-
-                file_content = read_file(temp_buf, arena);
-                if (!file_content.len) { // file SHOULD exist, verified through dir_or_file
-                    // TODO: 500
-                }
+                file_content = read_file(req->url_path, arena);
+                if (!file_content.len) // file SHOULD exist, verified through dir_or_file (err_500 already set)
+                    goto server_error;
 
                 *reply = (struct http_reply) {
                     .status = 200,
@@ -532,8 +310,8 @@ struct http_reply *http_process_req(struct http_req *req, struct arena *arena) {
                 break;
             default:
                 fprintf(stderr, "Unchecked return type %c from dir_or_file()\n", d_or_f);
-                // TODO: 500
-                break;
+                set_err_500("Unchecked return type from dir_or_file()", arena);
+                goto server_error;
         }
     }
 
@@ -560,8 +338,10 @@ bad_request:
 not_found:
     *reply = (struct http_reply) { .status = 404 };
 
-    struct sized_str file_content = read_file("/404.html", arena);
-    if (file_content.len) {
+    struct sized_str file_content = read_file((struct sized_str) { .ptr = "/404.html", .len = 9 }, arena);
+    if (g_err_500_msg)
+        goto server_error;
+    else if (file_content.len) {
         reply->body = file_content;
         reply->content_type = http_content_type_text_html;
     }
@@ -570,6 +350,17 @@ not_found:
 
 method_not_allowed:
     *reply = (struct http_reply) { .status = 405 };
+    return reply;
+
+server_error:
+    *reply = (struct http_reply) {
+        .status = 500,
+        .body = (struct sized_str) { .ptr = g_err_500_msg, .len = strlen(g_err_500_msg) },
+        .content_type = http_content_type_text_plain
+    };
+
+    g_err_500_msg = NULL;
+
     return reply;
 }
 
@@ -580,7 +371,7 @@ method_not_allowed:
     } while (0)
 
 struct sized_str http_prepare_res(struct http_reply *reply, struct http_req *req, struct arena *arena) {
-    char buffer[BUFFERSIZE] = { 0 }; // TODO: scratch arena???
+    char *buffer = arena_alloc(arena, BUFFERSIZE); // TODO: scratch arena???
     size_t msg_len = 0;
 
     APPEND_HEADER("HTTP/1.1 %d %s\r\n", reply->status, http_status_codes_str[reply->status]);
@@ -633,8 +424,10 @@ void *handle_client(void *args) {
 
             while (!(tracker = strstr(buffer, "\r\n\r\n")) && BUFFERSIZE-total_bytes_recvd) {
                 int bytes_recvd;
-                if ((bytes_recvd = recv(client_fd, buffer+total_bytes_recvd, BUFFERSIZE-total_bytes_recvd, 0)) < 0) // TODO: add timeout
-                    error_exit("recv()");
+                if ((bytes_recvd = recv(client_fd, buffer+total_bytes_recvd, BUFFERSIZE-total_bytes_recvd, 0)) < 0) { // TODO: add timeout
+                    set_err_500("failed to read data from socket", arena);
+                    goto processing_fasttrack;
+                }
 
                 total_bytes_recvd += bytes_recvd;
                 if (!total_bytes_recvd && !bytes_recvd)
@@ -643,7 +436,8 @@ void *handle_client(void *args) {
 
             if ((BUFFERSIZE == total_bytes_recvd) && !tracker) {
                 errno = EMSGSIZE;
-                error_exit("handle_client recv()");
+                set_err_500("request too long, buffer length 4KiB", arena);
+                goto processing_fasttrack;
             }
             
             struct http_req *req = http_parse_req_headers(buffer, total_bytes_recvd, arena);
@@ -652,8 +446,10 @@ void *handle_client(void *args) {
             if (req->content_length) {
                 while (req_len > total_bytes_recvd) {
                     int bytes_recvd;
-                    if ((bytes_recvd = recv(client_fd, buffer+total_bytes_recvd, BUFFERSIZE-total_bytes_recvd, 0)) < 0) // TODO: add timeout
-                        error_exit("recv()");
+                    if ((bytes_recvd = recv(client_fd, buffer+total_bytes_recvd, BUFFERSIZE-total_bytes_recvd, 0)) < 0) { // TODO: add timeout
+                        set_err_500("failed to read data from socket", arena);
+                        goto processing_fasttrack;
+                    }
 
                     total_bytes_recvd += bytes_recvd;
                 }
@@ -666,6 +462,7 @@ void *handle_client(void *args) {
             offset = total_bytes_recvd-req_len;
             memset(buffer+offset, 0, BUFFERSIZE-offset);
 
+        processing_fasttrack:;
             struct http_reply *reply = http_process_req(req, arena);
 
             log_req(req, reply);
@@ -676,8 +473,10 @@ void *handle_client(void *args) {
 
             while (total_bytes_sent < res.len) {
                 const int bytes_sent = send(client_fd, res.ptr+total_bytes_sent, res.len-total_bytes_sent, 0);
-                if (bytes_sent < 0)
-                    error_exit("send()");
+                if (bytes_sent < 0) {
+                    perror("\033[1;31merror:\033[0m send() failed, cannot respond to client");
+                    goto connection_terminated;
+                }
                 total_bytes_sent += bytes_sent;
             }
 
@@ -686,7 +485,7 @@ void *handle_client(void *args) {
 
     connection_terminated:
         if (shutdown(client_fd, SHUT_WR) < 0)
-            error_exit("shutdown()");
+            perror("\033[1;31merror:\033[0m shutdown() of socket failed");
 
         close(client_fd);
     }
@@ -731,7 +530,7 @@ int main(void) {
         int client_fd;
 
         if ((client_fd = accept(socket_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_length)) < 0)
-            error_exit("accept()");
+            perror("\033[1;31merror:\033[0m accept() failed, client dropped");
 
         enqueue(client_fd);
     }
